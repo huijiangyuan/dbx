@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::path_utils::expand_tilde;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -19,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::{sleep_until, Duration, Instant, MissedTickBehavior};
 
 use crate::db::ssh_host_key::{HostKeyState, HostKeyVerifier};
 use crate::db::ssh_prompt;
@@ -49,6 +50,11 @@ struct SshClient {
     host_key_verifier: Arc<HostKeyVerifier>,
     host: String,
     port: u16,
+    /// Set `true` while `prompt_for_host_key` is awaiting the user's TOFU
+    /// decision. The handshake-timeout driver in `connect_and_authenticate`
+    /// reads this to *pause* the network-phase timer during the prompt, so the
+    /// user's deliberation time never counts against the connection timeout.
+    prompt_active: Arc<AtomicBool>,
 }
 
 impl client::Handler for SshClient {
@@ -100,7 +106,13 @@ impl SshClient {
             return Ok(false);
         };
 
+        // Mark the TOFU prompt active so the outer handshake timer pauses while
+        // the user decides. Cleared immediately once the answer arrives (before
+        // we persist/learn), so it never lingers if the user is slow to click.
+        self.prompt_active.store(true, Ordering::SeqCst);
         let answer = tokio::time::timeout(TOFU_PROMPT_TIMEOUT, responder_rx).await;
+        self.prompt_active.store(false, Ordering::SeqCst);
+
         match answer {
             Ok(Ok(ssh_prompt::SshPromptAnswer::Accept { remember })) => {
                 if remember {
@@ -207,22 +219,49 @@ async fn connect_and_authenticate(
     // the temporary TCP endpoint. Unknown keys require explicit UI acceptance;
     // changed keys, missing prompt gateways, timeouts, and rejection fail closed.
     let host_key_verifier = Arc::new(HostKeyVerifier::new(known_hosts_path.to_path_buf()));
+    // Shared flag toggled by `prompt_for_host_key` while the user is deciding
+    // on an unknown host key. The handshake timer below pauses whenever this is
+    // set, so the user's deliberation time never counts against the connection
+    // timeout (and an accepted answer can never arrive at a dead responder).
+    let prompt_active = Arc::new(AtomicBool::new(false));
 
-    let mut session = tokio::time::timeout(
-        connect_timeout,
-        client::connect(
-            config,
-            (connect_host, connect_port),
-            SshClient {
-                host_key_verifier: host_key_verifier.clone(),
-                host: host_key_host.to_string(),
-                port: host_key_port,
-            },
-        ),
-    )
-    .await
-    .map_err(|_| format!("SSH connection timed out ({connect_timeout_secs}s)"))?
-    .map_err(|e| format!("SSH connection failed: {e}"))?;
+    // Box the connect future so it can be polled across `select!` iterations.
+    let mut connect_future = Box::pin(client::connect(
+        config,
+        (connect_host, connect_port),
+        SshClient {
+            host_key_verifier: host_key_verifier.clone(),
+            host: host_key_host.to_string(),
+            port: host_key_port,
+            prompt_active: prompt_active.clone(),
+        },
+    ));
+
+    // Network-phase budget is the configured `connect_timeout`. The embedded
+    // TOFU prompt (`check_server_key` -> `prompt_for_host_key`) suspends the
+    // handshake while the user decides; we *pause* the timer (re-extend its
+    // deadline) for as long as `prompt_active` is set, so a slow human does not
+    // trip the connection timeout. The prompt stays independently bounded by
+    // `TOFU_PROMPT_TIMEOUT` (fail-closed, inside `prompt_for_host_key`), so a
+    // stuck or closed UI still aborts the handshake on its own.
+    let mut handshake_deadline = Instant::now() + connect_timeout;
+    let mut handshake_sleep = Box::pin(sleep_until(handshake_deadline));
+    let mut session = loop {
+        tokio::select! {
+            res = &mut connect_future => {
+                break res.map_err(|e| format!("SSH connection failed: {e}"));
+            }
+            _ = &mut handshake_sleep => {
+                if prompt_active.load(Ordering::SeqCst) {
+                    // Prompt active: pause the network timer by extending it.
+                    handshake_deadline = Instant::now() + connect_timeout;
+                    handshake_sleep = Box::pin(sleep_until(handshake_deadline));
+                } else {
+                    break Err(format!("SSH connection timed out ({}s)", connect_timeout.as_secs()));
+                }
+            }
+        }
+    }?;
 
     // Probe with "none" authentication first. Some SSH proxies and jump-hosts
     // accept connections without any credential, and this is also the standard
@@ -1346,8 +1385,12 @@ mod tests {
         let key = test_server_public_key();
 
         install_fake_prompt_gateway(ssh_prompt::SshPromptAnswer::Accept { remember: true });
-        let mut client =
-            SshClient { host_key_verifier: Arc::new(verifier), host: "db.example.com".to_string(), port: 22 };
+        let mut client = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "db.example.com".to_string(),
+            port: 22,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
 
         let trusted = client.check_server_key(&key).await.unwrap();
         assert!(trusted, "accepted host key should be trusted");
@@ -1366,8 +1409,12 @@ mod tests {
         let key = test_server_public_key();
 
         install_fake_prompt_gateway(ssh_prompt::SshPromptAnswer::Accept { remember: false });
-        let mut client =
-            SshClient { host_key_verifier: Arc::new(verifier), host: "db.example.com".to_string(), port: 22 };
+        let mut client = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "db.example.com".to_string(),
+            port: 22,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
 
         let trusted = client.check_server_key(&key).await.unwrap();
         assert!(trusted, "accepted host key should be trusted for the session");
@@ -1388,8 +1435,12 @@ mod tests {
         let key = test_server_public_key();
 
         install_fake_prompt_gateway(ssh_prompt::SshPromptAnswer::Reject);
-        let mut client =
-            SshClient { host_key_verifier: Arc::new(verifier), host: "db.example.com".to_string(), port: 22 };
+        let mut client = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "db.example.com".to_string(),
+            port: 22,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
 
         let trusted = client.check_server_key(&key).await.unwrap();
         assert!(!trusted, "rejected host key must not be trusted");
@@ -1411,8 +1462,12 @@ mod tests {
         let verifier = HostKeyVerifier::new(path);
         let key = test_server_public_key();
 
-        let mut client =
-            SshClient { host_key_verifier: Arc::new(verifier), host: "db.example.com".to_string(), port: 22 };
+        let mut client = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "db.example.com".to_string(),
+            port: 22,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
         let trusted = client.check_server_key(&key).await.unwrap();
         // No UI to confirm -> fail-closed, host is not trusted.
         assert!(!trusted, "without a gateway, an unknown host must be rejected (fail-closed)");
@@ -1430,8 +1485,12 @@ mod tests {
 
         // No gateway installed, but the host is trusted so no prompt is needed.
         ssh_prompt::clear_ssh_prompt_gateway();
-        let mut client =
-            SshClient { host_key_verifier: Arc::new(verifier), host: "db.example.com".to_string(), port: 22 };
+        let mut client = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "db.example.com".to_string(),
+            port: 22,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
         let trusted = client.check_server_key(&key).await.unwrap();
         assert!(trusted, "a known-trusted host must be accepted without a prompt");
     }
@@ -1666,7 +1725,12 @@ uveF/dLmnVN1IriEyEvHAAAACGRieC10ZXN0AQIDBAU=
         let frozen = dir.path().join("frozen");
         std::fs::write(&frozen, b"not a directory").unwrap();
         let verifier = HostKeyVerifier::new(frozen.join("known_hosts"));
-        let handler = SshClient { host_key_verifier: Arc::new(verifier), host: "127.0.0.1".to_string(), port };
+        let handler = SshClient {
+            host_key_verifier: Arc::new(verifier),
+            host: "127.0.0.1".to_string(),
+            port,
+            prompt_active: Arc::new(AtomicBool::new(false)),
+        };
         let client_config = Arc::new(ssh_client_config());
 
         let connect_result =
